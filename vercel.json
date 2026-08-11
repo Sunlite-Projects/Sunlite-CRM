@@ -1,8 +1,5 @@
 {
   "rewrites": [
-    {
-      "source": "/go/:slug",
-      "destination": "https://script.google.com/macros/s/AKfycbzZQ4r4_63UPSsuWnSlH7sI3r1Y2gvvfIhZ9hY1RVJhwMeIguWLpSpmtW1l9LPLUbxR/exec?go=:slug"
-    }
+    { "source": "/go/:slug", "destination": "/api/go?slug=:slug" }
   ]
 }

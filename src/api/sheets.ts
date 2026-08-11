@@ -581,10 +581,17 @@ export interface ShortLink {
   slug: string;
   destination: string;
   label: string;
+  campaign: string;
   createdBy: string;
   createdDate: string;
   clicks: number;
-  daily: Record<string, number>; // 'yyyy-MM-dd' → count
+  active: boolean;
+  uniqueVisitors: number;
+  lastClick: string;
+  daily: Record<string, number>;    // 'yyyy-MM-dd' → count
+  device: Record<string, number>;   // 'Mobile'|'Desktop'|… → count
+  referrer: Record<string, number>; // referrer label → count
+  city: Record<string, number>;     // city → count
 }
 
 export async function fetchShortLinks(): Promise<ShortLink[]> {
@@ -596,9 +603,17 @@ export async function createShortLink(params: {
   slug: string;
   destination: string;
   label: string;
+  campaign: string;
   createdBy: string;
 }): Promise<{ status?: string; error?: string; slug?: string; destination?: string }> {
   return gasPost({ action: 'createShortLink', ...params });
+}
+
+export async function updateShortLink(
+  slug: string,
+  fields: Partial<{ destination: string; label: string; campaign: string; active: string }>,
+): Promise<{ status?: string; error?: string }> {
+  return gasPost({ action: 'updateShortLink', slug, ...fields });
 }
 
 export async function deleteShortLink(slug: string): Promise<{ status?: string }> {

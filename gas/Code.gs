@@ -1,6 +1,6 @@
 /**
  * GOOGLE APPS SCRIPT — SUNLITE CRM HUB
- * Version 4.6 — Shortlink system: ?go=SLUG redirect + click tracking, createShortLink/getShortLinks/deleteShortLink
+ * Version 4.7 — Shortlink analytics: unique visitors, device/referrer/city breakdowns, last click, repoint + on/off toggle
  *
  * Handles: login, customers (own + all), logs (read/save/delete), users,
  *          quick links, email send, gmail sync, customer-email update,
@@ -365,33 +365,64 @@ function doGet(e) {
     }
 
     if (action === "createShortLink") {
-      const slugRaw = (e.parameter.slug || "").toString().trim();
-      const dest    = (e.parameter.destination || "").toString().trim();
-      const label   = (e.parameter.label || "").toString().trim();
-      const by      = (e.parameter.createdBy || userEmail || "").toString().trim();
+      const slugRaw  = (e.parameter.slug || "").toString().trim();
+      const dest     = (e.parameter.destination || "").toString().trim();
+      const label    = (e.parameter.label || "").toString().trim();
+      const campaign = (e.parameter.campaign || "").toString().trim();
+      const by       = (e.parameter.createdBy || userEmail || "").toString().trim();
       if (!dest) return createJsonResponse({ error: "Destination is required" });
 
-      // Slugify (or auto-generate) and ensure uniqueness
+      const sheet = shortLinksSheet(ss);
+      const cols  = shortLinkCols(sheet);
       let slug = slugRaw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
-      const sheet = getOrCreateSheet(ss, "ShortLinks",
-        ["Slug", "Destination", "Label", "CreatedBy", "CreatedDate", "Clicks"]);
-      const existing = sheet.getDataRange().getValues().slice(1).map(r => String(r[0]).toLowerCase());
+      const existing = sheet.getDataRange().getValues().slice(1).map(r => String(r[cols.Slug]).toLowerCase());
       if (!slug) slug = Math.random().toString(36).slice(2, 8);
       if (existing.indexOf(slug) !== -1) return createJsonResponse({ error: "That slug is already taken" });
 
       let destination = dest;
       if (!/^https?:\/\//i.test(destination)) destination = "https://" + destination;
-      sheet.appendRow([slug, destination, label, by, new Date(), 0]);
+      const row = [];
+      row[cols.Slug] = slug;
+      row[cols.Destination] = destination;
+      row[cols.Label] = label;
+      row[cols.Campaign] = campaign;
+      row[cols.CreatedBy] = by;
+      row[cols.CreatedDate] = new Date();
+      row[cols.Clicks] = 0;
+      row[cols.Active] = "TRUE";
+      sheet.appendRow(row);
       return createJsonResponse({ status: "Success", slug: slug, destination: destination });
+    }
+
+    if (action === "updateShortLink") {
+      const slug  = (e.parameter.slug || "").toString().trim().toLowerCase();
+      const sheet = ss.getSheetByName("ShortLinks");
+      if (!sheet) return createJsonResponse({ error: "Not found" });
+      const cols = shortLinkCols(sheet);
+      const data = sheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][cols.Slug]).toLowerCase() !== slug) continue;
+        if (e.parameter.destination !== undefined) {
+          let d = String(e.parameter.destination).trim();
+          if (d && !/^https?:\/\//i.test(d)) d = "https://" + d;
+          sheet.getRange(i + 1, cols.Destination + 1).setValue(d);
+        }
+        if (e.parameter.label     !== undefined) sheet.getRange(i + 1, cols.Label + 1).setValue(String(e.parameter.label));
+        if (e.parameter.campaign  !== undefined) sheet.getRange(i + 1, cols.Campaign + 1).setValue(String(e.parameter.campaign));
+        if (e.parameter.active    !== undefined) sheet.getRange(i + 1, cols.Active + 1).setValue(String(e.parameter.active).toLowerCase() === "true" ? "TRUE" : "FALSE");
+        return createJsonResponse({ status: "Success" });
+      }
+      return createJsonResponse({ error: "Not found" });
     }
 
     if (action === "deleteShortLink") {
       const slug  = (e.parameter.slug || "").toString().trim().toLowerCase();
       const sheet = ss.getSheetByName("ShortLinks");
       if (!sheet) return createJsonResponse({ status: "Success" });
+      const cols = shortLinkCols(sheet);
       const data = sheet.getDataRange().getValues();
       for (let i = 1; i < data.length; i++) {
-        if (String(data[i][0]).toLowerCase() === slug) { sheet.deleteRow(i + 1); break; }
+        if (String(data[i][cols.Slug]).toLowerCase() === slug) { sheet.deleteRow(i + 1); break; }
       }
       return createJsonResponse({ status: "Success" });
     }
@@ -709,42 +740,88 @@ function createJsonResponse(data) {
 // SHORTLINKS
 // ─────────────────────────────────────────────────────────────────
 
-// Redirect handler for …/exec?go=SLUG — logs the click, bumps the counter,
-// and forwards the visitor to the destination via an HTML meta/JS redirect.
+// ShortLinks sheet with the full schema, created/migrated on demand.
+function shortLinksSheet(ss) {
+  const headers = ["Slug", "Destination", "Label", "Campaign", "CreatedBy", "CreatedDate", "Clicks", "Active"];
+  let sheet = ss.getSheetByName("ShortLinks");
+  if (!sheet) { sheet = ss.insertSheet("ShortLinks"); sheet.appendRow(headers); return sheet; }
+  if (sheet.getLastRow() === 0) { sheet.appendRow(headers); return sheet; }
+  // Add any missing columns (migration for links created before this version)
+  const have = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  headers.forEach(h => {
+    if (have.indexOf(h) === -1) { sheet.getRange(1, sheet.getLastColumn() + 1).setValue(h); have.push(h); }
+  });
+  return sheet;
+}
+
+// Column-index map for the ShortLinks sheet, keyed by header name.
+function shortLinkCols(sheet) {
+  const have = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  const idx = {};
+  ["Slug", "Destination", "Label", "Campaign", "CreatedBy", "CreatedDate", "Clicks", "Active"].forEach(k => {
+    idx[k] = have.indexOf(k);
+  });
+  return idx;
+}
+
+// Device bucket from a user-agent string.
+function deviceFromUA(ua) {
+  const u = String(ua || "").toLowerCase();
+  if (!u) return "Unknown";
+  if (/ipad|tablet/.test(u)) return "Tablet";
+  if (/mobi|iphone|android/.test(u)) return "Mobile";
+  return "Desktop";
+}
+
+// Redirect handler for …/exec?go=SLUG — logs a rich click and forwards.
+// The Vercel edge function passes ua/ref/city/country/vid; fmt=json returns
+// { destination } so the edge function can issue a real 302.
 function handleShortLinkRedirect(ss, e) {
   const slug  = String(e.parameter.go || "").trim().toLowerCase();
-  const sheet = ss.getSheetByName("ShortLinks");
+  const sheet = shortLinksSheet(ss);
+  const cols  = shortLinkCols(sheet);
   let destination = "";
+  let active = true;
 
-  if (sheet) {
-    const data = sheet.getDataRange().getValues();
-    for (let i = 1; i < data.length; i++) {
-      if (String(data[i][0]).toLowerCase() === slug) {
-        destination = String(data[i][1] || "").trim();
-        // Increment the click counter (column 6 = Clicks)
-        const current = Number(data[i][5] || 0);
-        sheet.getRange(i + 1, 6).setValue(current + 1);
-        break;
-      }
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][cols.Slug]).toLowerCase() === slug) {
+      destination = String(data[i][cols.Destination] || "").trim();
+      active = String(data[i][cols.Active]).toLowerCase() !== "false";
+      if (active) sheet.getRange(i + 1, cols.Clicks + 1).setValue(Number(data[i][cols.Clicks] || 0) + 1);
+      break;
     }
   }
 
-  // Log the click for time-series stats
-  if (destination) {
-    const clicks = getOrCreateSheet(ss, "ShortLinkClicks", ["Slug", "Timestamp", "UserAgent", "Referrer"]);
+  // Log the click (only for a live link with a destination)
+  if (destination && active) {
+    const clicks = getOrCreateSheet(ss, "ShortLinkClicks",
+      ["Slug", "Timestamp", "Device", "Referrer", "City", "Country", "Visitor"]);
+    const ref = String(e.parameter.ref || "").trim();
+    let refLabel = "Direct / QR / app";
+    if (ref) { try { refLabel = ref.replace(/^https?:\/\//, "").split("/")[0]; } catch (er) { refLabel = ref; } }
     clicks.appendRow([
       slug,
       new Date(),
-      String((e.parameter.ua) || ""),
-      String((e.parameter.ref) || "")
+      String(e.parameter.device || deviceFromUA(e.parameter.ua)),
+      refLabel,
+      String(e.parameter.city || ""),
+      String(e.parameter.country || ""),
+      String(e.parameter.vid || "")
     ]);
   }
 
-  const target = destination || (getAppUrl());
+  const target = (active && destination) ? destination : getAppUrl();
+
+  // JSON mode for the edge function → it issues the real 302.
+  if (String(e.parameter.fmt) === "json") {
+    return createJsonResponse({ destination: target, active: active });
+  }
+
+  // Fallback HTML redirect (if hit directly)
   const safe = target.replace(/"/g, "&quot;").replace(/</g, "&lt;");
   const html = '<!DOCTYPE html><html><head>' +
     '<meta http-equiv="refresh" content="0; url=' + safe + '">' +
-    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
     '<title>Redirecting…</title></head>' +
     '<body style="font-family:Arial,sans-serif;text-align:center;padding:40px;color:#555;">' +
     'Redirecting…<script>window.location.replace("' + target.replace(/"/g, '\\"') + '");</script>' +
@@ -755,43 +832,67 @@ function handleShortLinkRedirect(ss, e) {
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
-// Returns all short links with total clicks + a per-day click breakdown.
+// Returns all short links with full stats: unique visitors, last click,
+// per-day (30d), and device / referrer / city breakdowns.
 function getShortLinksData(ss) {
   const sheet = ss.getSheetByName("ShortLinks");
   if (!sheet) return [];
+  const cols = shortLinkCols(sheet);
   const data = sheet.getDataRange().getValues();
   if (data.length < 2) return [];
 
-  // Build per-slug daily click map from the click log
   const tz = Session.getScriptTimeZone();
-  const byDay = {}; // slug → { 'yyyy-MM-dd': count }
+  const stats = {}; // slug → aggregates
   const clickSheet = ss.getSheetByName("ShortLinkClicks");
   if (clickSheet) {
     const cData = clickSheet.getDataRange().getValues();
+    const ch = cData[0].map(h => String(h).trim());
+    const ci = {
+      Slug: ch.indexOf("Slug"), Timestamp: ch.indexOf("Timestamp"), Device: ch.indexOf("Device"),
+      Referrer: ch.indexOf("Referrer"), City: ch.indexOf("City"), Visitor: ch.indexOf("Visitor")
+    };
     for (let i = 1; i < cData.length; i++) {
-      const slug = String(cData[i][0] || "").toLowerCase();
-      const raw  = cData[i][1];
-      if (!slug || !raw) continue;
+      const slug = String(cData[i][ci.Slug] || "").toLowerCase();
+      if (!slug) continue;
+      const raw = cData[i][ci.Timestamp];
       const d = raw instanceof Date ? raw : new Date(raw);
       if (isNaN(d.getTime())) continue;
+      if (!stats[slug]) stats[slug] = { daily: {}, device: {}, referrer: {}, city: {}, visitors: {}, last: null };
+      const s = stats[slug];
       const day = Utilities.formatDate(d, tz, "yyyy-MM-dd");
-      if (!byDay[slug]) byDay[slug] = {};
-      byDay[slug][day] = (byDay[slug][day] || 0) + 1;
+      s.daily[day] = (s.daily[day] || 0) + 1;
+      const dev = String(cData[i][ci.Device] || "Unknown") || "Unknown";
+      s.device[dev] = (s.device[dev] || 0) + 1;
+      const ref = String(cData[i][ci.Referrer] || "Direct / QR / app") || "Direct / QR / app";
+      s.referrer[ref] = (s.referrer[ref] || 0) + 1;
+      const city = String((ci.City >= 0 ? cData[i][ci.City] : "") || "Unknown") || "Unknown";
+      s.city[city] = (s.city[city] || 0) + 1;
+      const vid = String((ci.Visitor >= 0 ? cData[i][ci.Visitor] : "") || "");
+      if (vid) s.visitors[vid] = true;
+      if (!s.last || d.getTime() > s.last) s.last = d.getTime();
     }
   }
 
   const out = [];
   for (let i = 1; i < data.length; i++) {
-    const slug = String(data[i][0] || "");
+    const slug = String(data[i][cols.Slug] || "");
     if (!slug) continue;
+    const s = stats[slug.toLowerCase()] || { daily: {}, device: {}, referrer: {}, city: {}, visitors: {}, last: null };
     out.push({
       slug: slug,
-      destination: String(data[i][1] || ""),
-      label: String(data[i][2] || ""),
-      createdBy: String(data[i][3] || ""),
-      createdDate: data[i][4] instanceof Date ? data[i][4].toISOString() : String(data[i][4] || ""),
-      clicks: Number(data[i][5] || 0),
-      daily: byDay[slug.toLowerCase()] || {}
+      destination: String(data[i][cols.Destination] || ""),
+      label: String(data[i][cols.Label] || ""),
+      campaign: cols.Campaign >= 0 ? String(data[i][cols.Campaign] || "") : "",
+      createdBy: String(data[i][cols.CreatedBy] || ""),
+      createdDate: data[i][cols.CreatedDate] instanceof Date ? data[i][cols.CreatedDate].toISOString() : String(data[i][cols.CreatedDate] || ""),
+      clicks: Number(data[i][cols.Clicks] || 0),
+      active: cols.Active >= 0 ? String(data[i][cols.Active]).toLowerCase() !== "false" : true,
+      uniqueVisitors: Object.keys(s.visitors).length,
+      lastClick: s.last ? new Date(s.last).toISOString() : "",
+      daily: s.daily,
+      device: s.device,
+      referrer: s.referrer,
+      city: s.city
     });
   }
   return out.reverse();
