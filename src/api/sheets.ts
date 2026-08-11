@@ -574,3 +574,39 @@ export async function pingGAS(): Promise<boolean> {
     return false;
   }
 }
+
+// ── Shortlinks (marketing) ─────────────────────────────────────
+
+export interface ShortLink {
+  slug: string;
+  destination: string;
+  label: string;
+  createdBy: string;
+  createdDate: string;
+  clicks: number;
+  daily: Record<string, number>; // 'yyyy-MM-dd' → count
+}
+
+export async function fetchShortLinks(): Promise<ShortLink[]> {
+  const raw = await gasGet<ShortLink[]>('getShortLinks');
+  return Array.isArray(raw) ? raw : [];
+}
+
+export async function createShortLink(params: {
+  slug: string;
+  destination: string;
+  label: string;
+  createdBy: string;
+}): Promise<{ status?: string; error?: string; slug?: string; destination?: string }> {
+  return gasPost({ action: 'createShortLink', ...params });
+}
+
+export async function deleteShortLink(slug: string): Promise<{ status?: string }> {
+  return gasPost({ action: 'deleteShortLink', slug });
+}
+
+// The public redirect base — pretty path served by the Vercel rewrite in vercel.json.
+export function shortLinkUrl(slug: string): string {
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://sunlite-crm.vercel.app';
+  return `${origin}/go/${slug}`;
+}

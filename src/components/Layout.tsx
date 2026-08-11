@@ -1,10 +1,10 @@
 import { type ReactNode, useState } from 'react';
-import { LayoutDashboard, Users, MessageSquare, Link2, LogOut, Bell, RefreshCw, Menu, X, Mail, Settings, BarChart2 } from 'lucide-react';
+import { LayoutDashboard, Users, MessageSquare, Link2, LogOut, Bell, RefreshCw, Menu, X, Mail, Settings, BarChart2, QrCode } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { useCustomerStore } from '../store/customerStore';
 import NotificationCenter from './NotificationCenter';
 
-type Page = 'dashboard' | 'customers' | 'activity' | 'quicklinks' | 'settings' | 'reports';
+type Page = 'dashboard' | 'customers' | 'activity' | 'quicklinks' | 'settings' | 'reports' | 'marketing';
 
 interface LayoutProps {
   children: ReactNode;
@@ -23,13 +23,20 @@ const BASE_NAV_ITEMS = [
 export default function Layout({ children, currentPage, onNavigate }: LayoutProps) {
   const { currentUser, logout } = useAuthStore();
 
-  const NAV_ITEMS = currentUser?.role === 'owner'
+  const role = currentUser?.role;
+  const baseNav = role === 'owner'
     ? [
         BASE_NAV_ITEMS[0],
         { id: 'reports' as Page, label: 'Reports', icon: BarChart2 },
         ...BASE_NAV_ITEMS.slice(1),
       ]
     : BASE_NAV_ITEMS;
+  // Marketing Links: admin/owner manage; inside sales & customer service view.
+  const canSeeMarketing =
+    role === 'admin' || role === 'owner' || role === 'inside_sales' || role === 'customer_service';
+  const NAV_ITEMS = canSeeMarketing
+    ? [...baseNav, { id: 'marketing' as Page, label: 'Marketing', icon: QrCode }]
+    : baseNav;
   const { isSyncing, triggerSync, syncEmails, isSyncingEmails } = useCustomerStore();
   const [showNotifications, setShowNotifications] = useState(false);
   const [showMobileMenu, setShowMobileMenu] = useState(false);

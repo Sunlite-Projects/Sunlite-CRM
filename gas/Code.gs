@@ -1,6 +1,6 @@
 /**
  * GOOGLE APPS SCRIPT — SUNLITE CRM HUB
- * Version 4.5 — Map "Rep Group" column so rep-managed accounts show their rep group
+ * Version 4.6 — Shortlink system: ?go=SLUG redirect + click tracking, createShortLink/getShortLinks/deleteShortLink
  *
  * Handles: login, customers (own + all), logs (read/save/delete), users,
  *          quick links, email send, gmail sync, customer-email update,
@@ -50,6 +50,12 @@ function doGet(e) {
   const ss        = SpreadsheetApp.getActiveSpreadsheet();
   const action    = e.parameter.action;
   const userEmail = (e.parameter.userEmail || "").toString().toLowerCase().trim();
+
+  // ──────────────────────────────────── SHORTLINK REDIRECT
+  // Hit as …/exec?go=SLUG — logs the click and forwards to the destination.
+  if (e.parameter.go) {
+    return handleShortLinkRedirect(ss, e);
+  }
 
   try {
 
@@ -351,6 +357,43 @@ function doGet(e) {
         });
         return obj;
       }));
+    }
+
+    // ──────────────────────────────────── SHORTLINKS (marketing)
+    if (action === "getShortLinks") {
+      return createJsonResponse(getShortLinksData(ss));
+    }
+
+    if (action === "createShortLink") {
+      const slugRaw = (e.parameter.slug || "").toString().trim();
+      const dest    = (e.parameter.destination || "").toString().trim();
+      const label   = (e.parameter.label || "").toString().trim();
+      const by      = (e.parameter.createdBy || userEmail || "").toString().trim();
+      if (!dest) return createJsonResponse({ error: "Destination is required" });
+
+      // Slugify (or auto-generate) and ensure uniqueness
+      let slug = slugRaw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+      const sheet = getOrCreateSheet(ss, "ShortLinks",
+        ["Slug", "Destination", "Label", "CreatedBy", "CreatedDate", "Clicks"]);
+      const existing = sheet.getDataRange().getValues().slice(1).map(r => String(r[0]).toLowerCase());
+      if (!slug) slug = Math.random().toString(36).slice(2, 8);
+      if (existing.indexOf(slug) !== -1) return createJsonResponse({ error: "That slug is already taken" });
+
+      let destination = dest;
+      if (!/^https?:\/\//i.test(destination)) destination = "https://" + destination;
+      sheet.appendRow([slug, destination, label, by, new Date(), 0]);
+      return createJsonResponse({ status: "Success", slug: slug, destination: destination });
+    }
+
+    if (action === "deleteShortLink") {
+      const slug  = (e.parameter.slug || "").toString().trim().toLowerCase();
+      const sheet = ss.getSheetByName("ShortLinks");
+      if (!sheet) return createJsonResponse({ status: "Success" });
+      const data = sheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][0]).toLowerCase() === slug) { sheet.deleteRow(i + 1); break; }
+      }
+      return createJsonResponse({ status: "Success" });
     }
 
     // ──────────────────────────────────── 7. SEND EMAIL
@@ -661,6 +704,98 @@ function createJsonResponse(data) {
 // ─────────────────────────────────────────────────────────────────
 // HELPERS — GENERAL
 // ─────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────
+// SHORTLINKS
+// ─────────────────────────────────────────────────────────────────
+
+// Redirect handler for …/exec?go=SLUG — logs the click, bumps the counter,
+// and forwards the visitor to the destination via an HTML meta/JS redirect.
+function handleShortLinkRedirect(ss, e) {
+  const slug  = String(e.parameter.go || "").trim().toLowerCase();
+  const sheet = ss.getSheetByName("ShortLinks");
+  let destination = "";
+
+  if (sheet) {
+    const data = sheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).toLowerCase() === slug) {
+        destination = String(data[i][1] || "").trim();
+        // Increment the click counter (column 6 = Clicks)
+        const current = Number(data[i][5] || 0);
+        sheet.getRange(i + 1, 6).setValue(current + 1);
+        break;
+      }
+    }
+  }
+
+  // Log the click for time-series stats
+  if (destination) {
+    const clicks = getOrCreateSheet(ss, "ShortLinkClicks", ["Slug", "Timestamp", "UserAgent", "Referrer"]);
+    clicks.appendRow([
+      slug,
+      new Date(),
+      String((e.parameter.ua) || ""),
+      String((e.parameter.ref) || "")
+    ]);
+  }
+
+  const target = destination || (getAppUrl());
+  const safe = target.replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  const html = '<!DOCTYPE html><html><head>' +
+    '<meta http-equiv="refresh" content="0; url=' + safe + '">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<title>Redirecting…</title></head>' +
+    '<body style="font-family:Arial,sans-serif;text-align:center;padding:40px;color:#555;">' +
+    'Redirecting…<script>window.location.replace("' + target.replace(/"/g, '\\"') + '");</script>' +
+    '<p>If you are not redirected, <a href="' + safe + '">click here</a>.</p>' +
+    '</body></html>';
+  return HtmlService.createHtmlOutput(html)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// Returns all short links with total clicks + a per-day click breakdown.
+function getShortLinksData(ss) {
+  const sheet = ss.getSheetByName("ShortLinks");
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return [];
+
+  // Build per-slug daily click map from the click log
+  const tz = Session.getScriptTimeZone();
+  const byDay = {}; // slug → { 'yyyy-MM-dd': count }
+  const clickSheet = ss.getSheetByName("ShortLinkClicks");
+  if (clickSheet) {
+    const cData = clickSheet.getDataRange().getValues();
+    for (let i = 1; i < cData.length; i++) {
+      const slug = String(cData[i][0] || "").toLowerCase();
+      const raw  = cData[i][1];
+      if (!slug || !raw) continue;
+      const d = raw instanceof Date ? raw : new Date(raw);
+      if (isNaN(d.getTime())) continue;
+      const day = Utilities.formatDate(d, tz, "yyyy-MM-dd");
+      if (!byDay[slug]) byDay[slug] = {};
+      byDay[slug][day] = (byDay[slug][day] || 0) + 1;
+    }
+  }
+
+  const out = [];
+  for (let i = 1; i < data.length; i++) {
+    const slug = String(data[i][0] || "");
+    if (!slug) continue;
+    out.push({
+      slug: slug,
+      destination: String(data[i][1] || ""),
+      label: String(data[i][2] || ""),
+      createdBy: String(data[i][3] || ""),
+      createdDate: data[i][4] instanceof Date ? data[i][4].toISOString() : String(data[i][4] || ""),
+      clicks: Number(data[i][5] || 0),
+      daily: byDay[slug.toLowerCase()] || {}
+    });
+  }
+  return out.reverse();
+}
 
 function getAppUrl() {
   return PropertiesService.getScriptProperties().getProperty("APP_URL") || "https://sunlite-crm.vercel.app/";
